@@ -14,21 +14,49 @@ This app loads precomputed groupings and merged data, allowing you to:
 """)
 
 @st.cache_data
-def load_precomputed_data():
-    # Load precomputed dictionaries
-    with open("product_top_vars.pkl", "rb") as f:
-        product_top_vars = pickle.load(f)
-    with open("grouped_products.pkl", "rb") as f:
-        grouped_products = pickle.load(f)
-    
-    # Attempt to load the merged CSV and parse the 'Date' column
-    try:
-        merged_df = pd.read_csv("merged_data.csv", parse_dates=["Date"])
-    except ValueError as e:
-        # If "Date" is not found, load without parsing and issue a warning.
-        merged_df = pd.read_csv("merged_data.csv")
-        st.warning("The 'Date' column was not found in merged_data.csv; ensure the precomputed file is correct.")
-    return product_top_vars, grouped_products, merged_df
+def compute_groupings(merged_df):
+    # Define the external variables (features) to be used in the model
+    ext_features = ['ECG_DESP', 'TUAV', 'PIB_CO', 'ISE_CO', 'VTOTAL_19', 'OTOTAL_19', 'ICI']
+    products = merged_df['Product Name'].unique()
+    product_top_vars = {}
+    threshold_min_records = 10  # Only analyze products with at least 10 months of data
+
+    st.text("Performing product analysis... (this may take a few moments)")
+    for prod in products:
+        prod_df = merged_df[merged_df['Product Name'] == prod]
+        if len(prod_df) < threshold_min_records:
+            continue
+        
+        # Prepare predictor variables and target
+        X_prod = prod_df[ext_features]
+        y_prod = prod_df['Customer Order Quantity']
+        
+        # Train a lightweight XGBoost model (using fewer boosting rounds for speed)
+        model = xgb.XGBRegressor(n_estimators=10, random_state=0)
+        model.fit(X_prod, y_prod)
+        
+        # Compute SHAP values using TreeExplainer
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_prod)
+        
+        # Compute the mean of the absolute SHAP values for each feature
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        
+        # Select the feature with the highest average absolute SHAP value
+        dominant_feature_index = np.argmax(mean_abs_shap)
+        dominant_feature = ext_features[dominant_feature_index]
+        
+        # Store this primary dominant feature for the product
+        product_top_vars[prod] = dominant_feature
+
+    # Group products by their single dominant external variable
+    grouped_products = {}
+    for prod, feat in product_top_vars.items():
+        if feat not in grouped_products:
+            grouped_products[feat] = []
+        grouped_products[feat].append(prod)
+        
+    return product_top_vars, grouped_products
 
 product_top_vars, grouped_products, merged_df = load_precomputed_data()
 
