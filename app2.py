@@ -7,13 +7,17 @@ import matplotlib.pyplot as plt
 
 st.title("Forecasting with Explainable AI – Group Analysis")
 st.markdown("""
-This app computes groupings of products based on their dominant external variable (determined via SHAP analysis) and then allows you to:
-- **Filter by Group:** Choose a dominant external variable group and see which products belong to it.
+This app computes groupings of products based on their dominant external variable (determined via a SHAP analysis) and then allows you to:
+- **Filter by Group:** Choose a dominant external variable group to see which products belong to it.
 - **Filter by Product:** Select a specific product and display all products in its group.
-Finally, the app trains a model on the filtered group data and displays the SHAP summary plot.
+
+The app then trains a model on the filtered group data and displays a SHAP summary plot for that group.
 """)
 
-@st.cache_data
+# ----------------------------------------------------------------
+# 1. Reading and Preprocessing Data
+# ----------------------------------------------------------------
+@st.cache_data(show_spinner=True)
 def load_merged_data():
     # Load Sales Data from Dropbox
     sales_url = ("https://www.dropbox.com/scl/fi/qs4xxntaz77hxoqqv12ol/"
@@ -29,21 +33,22 @@ def load_merged_data():
     ext_var['DATE'] = pd.to_datetime(ext_var['DATE'], format="%b-%y")
     ext_var = ext_var.set_index('DATE')
     
-    # Group monthly sales per product using Month End ('ME')
+    # Group monthly sales per product (sum of Customer Order Quantity) using Month End ('ME')
     corona_monthly_sales_material = corona_sales.groupby(
         [pd.Grouper(level='Date', freq='ME'), 'Product Name']
     )['Customer Order Quantity'].sum().reset_index()
     
-    # Adjust to monthly period timestamps
+    # Set the Date column as index and adjust to monthly period timestamps
     corona_monthly_sales_material.set_index('Date', inplace=True)
     corona_monthly_sales_material.index = corona_monthly_sales_material.index.to_period('M').to_timestamp()
     
-    # Filter ext_var to match the date range of sales
+    # Filter ext_var to the sales date range
     ext_var.index = pd.to_datetime(ext_var.index)
     min_date = corona_monthly_sales_material.index.min()
     max_date = corona_monthly_sales_material.index.max()
     ext_var = ext_var[(ext_var.index >= min_date) & (ext_var.index <= max_date)]
     
+    # Reset the sales index for merging while preserving timestamp format
     corona_monthly_sales_material_reset = corona_monthly_sales_material.reset_index()
     corona_monthly_sales_material_reset.set_index('Date', inplace=True)
     corona_monthly_sales_material_reset.index = corona_monthly_sales_material_reset.index.to_period('M').to_timestamp()
@@ -53,14 +58,20 @@ def load_merged_data():
                          left_index=True, right_index=True, how='inner')
     return merged_df
 
-@st.cache_data
+# ----------------------------------------------------------------
+# 2. Compute Product Analysis and Grouping Using SHAP
+# ----------------------------------------------------------------
+@st.cache_data(show_spinner=True)
 def compute_groupings(merged_df):
+    # Define external variables (features) for the model
     ext_features = ['ECG_DESP', 'TUAV', 'PIB_CO', 'ISE_CO', 'VTOTAL_19', 'OTOTAL_19', 'ICI']
     products = merged_df['Product Name'].unique()
     product_top_vars = {}
-    threshold_min_records = 10
+    threshold_min_records = 10  # Only analyze products with at least 10 months of data
 
     st.text("Performing product analysis... (this may take a few moments)")
+    # For speed, we reduce the number of boosting rounds (n_estimators) to 10. 
+    # (For more accurate models in production, consider precomputing and caching these results.)
     for prod in products:
         prod_df = merged_df[merged_df['Product Name'] == prod]
         if len(prod_df) < threshold_min_records:
@@ -68,7 +79,7 @@ def compute_groupings(merged_df):
         X_prod = prod_df[ext_features]
         y_prod = prod_df['Customer Order Quantity']
         
-        model = xgb.XGBRegressor(n_estimators=100, random_state=0)
+        model = xgb.XGBRegressor(n_estimators=10, random_state=0)  # Reduced boosting rounds for speed
         model.fit(X_prod, y_prod)
         
         explainer = shap.TreeExplainer(model)
@@ -80,6 +91,7 @@ def compute_groupings(merged_df):
         top_features = [feature for feature, imp in zip(ext_features, shap_abs_mean) if imp >= threshold_val]
         product_top_vars[prod] = top_features
 
+    # Group products by their dominant external variable(s)
     grouped_products = {}
     for prod, features in product_top_vars.items():
         for feat in features:
@@ -89,9 +101,15 @@ def compute_groupings(merged_df):
     
     return product_top_vars, grouped_products
 
+# ----------------------------------------------------------------
+# Main App Execution
+# ----------------------------------------------------------------
 merged_df = load_merged_data()
 product_top_vars, grouped_products = compute_groupings(merged_df)
 
+# ----------------------------------------------------------------
+# 3. User Interface: Filtering Options
+# ----------------------------------------------------------------
 st.sidebar.header("Filter Options")
 filter_option = st.sidebar.radio("Filter by:", ("Group", "Product"))
 
@@ -107,10 +125,16 @@ else:
     filtered_products = grouped_products.get(primary_group, [selected_product])
     st.sidebar.write(filtered_products)
 
+# ----------------------------------------------------------------
+# 4. Filter Data and Display Overview
+# ----------------------------------------------------------------
 filtered_df = merged_df[merged_df["Product Name"].isin(filtered_products)]
 st.markdown("### Data Overview for Selected Group")
 st.write(filtered_df.head())
 
+# ----------------------------------------------------------------
+# 5. Train Model on Group Data & Display SHAP Summary Plot
+# ----------------------------------------------------------------
 st.markdown("### SHAP Summary Plot for Selected Group")
 if len(filtered_df) < 10:
     st.write("Not enough data in this group to train a reliable model and compute SHAP values.")
@@ -119,7 +143,7 @@ else:
     X_group = filtered_df[group_features]
     y_group = filtered_df["Customer Order Quantity"]
     
-    model_group = xgb.XGBRegressor(n_estimators=100, random_state=0)
+    model_group = xgb.XGBRegressor(n_estimators=10, random_state=0)  # Use fewer rounds for speed
     model_group.fit(X_group, y_group)
     
     explainer_group = shap.TreeExplainer(model_group)
