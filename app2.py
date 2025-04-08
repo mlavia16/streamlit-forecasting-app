@@ -1,115 +1,38 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import pickle
+import matplotlib.pyplot as plt
 import xgboost as xgb
 import shap
-import matplotlib.pyplot as plt
 
-st.title("Forecasting with Explainable AI – Group Analysis")
+st.title("Forecasting with Explainable AI – Group Analysis (Precomputed)")
 st.markdown("""
-This app computes groupings of products based on their dominant external variable (determined via a SHAP analysis) and then allows you to:
-- **Filter by Group:** Choose a dominant external variable group to see which products belong to it.
-- **Filter by Product:** Select a specific product and display all products in its group.
-
-The app then trains a model on the filtered group data and displays a SHAP summary plot for that group.
+This app loads precomputed groupings and merged data, allowing you to:
+- Filter by group (i.e. dominant external variable) or by a specific product.
+- View the list of products in the selected group.
+- See a SHAP summary plot for the selected group’s forecasting model.
 """)
 
-# ----------------------------------------------------------------
-# 1. Reading and Preprocessing Data
-# ----------------------------------------------------------------
-@st.cache_data(show_spinner=True)
-def load_merged_data():
-    # Load Sales Data from Dropbox
-    sales_url = ("https://www.dropbox.com/scl/fi/qs4xxntaz77hxoqqv12ol/"
-                 "Customer-Order-Quantity_Dispatched-Quantity.xlsx?rlkey=w13c0i2hl2h1c85wfugvy7hz2&dl=1")
-    corona_sales = pd.read_excel(sales_url, engine="openpyxl")
-    corona_sales['Date'] = pd.to_datetime(corona_sales['Date'], format="%d.%m.%Y")
-    corona_sales = corona_sales.set_index('Date')
+@st.cache_data
+def load_precomputed_data():
+    # Load precomputed dictionaries
+    with open("product_top_vars.pkl", "rb") as f:
+        product_top_vars = pickle.load(f)
+    with open("grouped_products.pkl", "rb") as f:
+        grouped_products = pickle.load(f)
     
-    # Load External Variables Data from Dropbox (sheet 'Variables')
-    ext_url = ("https://www.dropbox.com/scl/fi/f3pfypvlegrmv3d15bpw0/"
-               "External_Variables.xlsx?rlkey=51dv464wk0wy703535m27vutu&st=bn3i3su0&dl=1")
-    ext_var = pd.read_excel(ext_url, engine="openpyxl", sheet_name='Variables')
-    ext_var['DATE'] = pd.to_datetime(ext_var['DATE'], format="%b-%y")
-    ext_var = ext_var.set_index('DATE')
-    
-    # Group monthly sales per product (sum of Customer Order Quantity) using Month End ('ME')
-    corona_monthly_sales_material = corona_sales.groupby(
-        [pd.Grouper(level='Date', freq='ME'), 'Product Name']
-    )['Customer Order Quantity'].sum().reset_index()
-    
-    # Set the Date column as index and adjust to monthly period timestamps
-    corona_monthly_sales_material.set_index('Date', inplace=True)
-    corona_monthly_sales_material.index = corona_monthly_sales_material.index.to_period('M').to_timestamp()
-    
-    # Filter ext_var to the sales date range
-    ext_var.index = pd.to_datetime(ext_var.index)
-    min_date = corona_monthly_sales_material.index.min()
-    max_date = corona_monthly_sales_material.index.max()
-    ext_var = ext_var[(ext_var.index >= min_date) & (ext_var.index <= max_date)]
-    
-    # Reset the sales index for merging while preserving timestamp format
-    corona_monthly_sales_material_reset = corona_monthly_sales_material.reset_index()
-    corona_monthly_sales_material_reset.set_index('Date', inplace=True)
-    corona_monthly_sales_material_reset.index = corona_monthly_sales_material_reset.index.to_period('M').to_timestamp()
-    
-    # Merge both DataFrames on the date index (inner join)
-    merged_df = pd.merge(corona_monthly_sales_material_reset, ext_var,
-                         left_index=True, right_index=True, how='inner')
-    return merged_df
+    # Attempt to load the merged CSV and parse the 'Date' column
+    try:
+        merged_df = pd.read_csv("merged_data.csv", parse_dates=["Date"])
+    except ValueError as e:
+        # If "Date" is not found, load without parsing and issue a warning.
+        merged_df = pd.read_csv("merged_data.csv")
+        st.warning("The 'Date' column was not found in merged_data.csv; ensure the precomputed file is correct.")
+    return product_top_vars, grouped_products, merged_df
 
-# ----------------------------------------------------------------
-# 2. Compute Product Analysis and Grouping Using SHAP
-# ----------------------------------------------------------------
-@st.cache_data(show_spinner=True)
-def compute_groupings(merged_df):
-    # Define external variables (features) for the model
-    ext_features = ['ECG_DESP', 'TUAV', 'PIB_CO', 'ISE_CO', 'VTOTAL_19', 'OTOTAL_19', 'ICI']
-    products = merged_df['Product Name'].unique()
-    product_top_vars = {}
-    threshold_min_records = 10  # Only analyze products with at least 10 months of data
+product_top_vars, grouped_products, merged_df = load_precomputed_data()
 
-    st.text("Performing product analysis... (this may take a few moments)")
-    # For speed, we reduce the number of boosting rounds (n_estimators) to 10. 
-    # (For more accurate models in production, consider precomputing and caching these results.)
-    for prod in products:
-        prod_df = merged_df[merged_df['Product Name'] == prod]
-        if len(prod_df) < threshold_min_records:
-            continue
-        X_prod = prod_df[ext_features]
-        y_prod = prod_df['Customer Order Quantity']
-        
-        model = xgb.XGBRegressor(n_estimators=10, random_state=0)  # Reduced boosting rounds for speed
-        model.fit(X_prod, y_prod)
-        
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X_prod)
-        shap_abs_mean = np.abs(shap_values).mean(axis=0)
-        
-        max_importance = np.max(shap_abs_mean)
-        threshold_val = 0.9 * max_importance
-        top_features = [feature for feature, imp in zip(ext_features, shap_abs_mean) if imp >= threshold_val]
-        product_top_vars[prod] = top_features
-
-    # Group products by their dominant external variable(s)
-    grouped_products = {}
-    for prod, features in product_top_vars.items():
-        for feat in features:
-            if feat not in grouped_products:
-                grouped_products[feat] = []
-            grouped_products[feat].append(prod)
-    
-    return product_top_vars, grouped_products
-
-# ----------------------------------------------------------------
-# Main App Execution
-# ----------------------------------------------------------------
-merged_df = load_merged_data()
-product_top_vars, grouped_products = compute_groupings(merged_df)
-
-# ----------------------------------------------------------------
-# 3. User Interface: Filtering Options
-# ----------------------------------------------------------------
+# Sidebar filtering options
 st.sidebar.header("Filter Options")
 filter_option = st.sidebar.radio("Filter by:", ("Group", "Product"))
 
@@ -125,16 +48,12 @@ else:
     filtered_products = grouped_products.get(primary_group, [selected_product])
     st.sidebar.write(filtered_products)
 
-# ----------------------------------------------------------------
-# 4. Filter Data and Display Overview
-# ----------------------------------------------------------------
+# Filter merged data based on selected products
 filtered_df = merged_df[merged_df["Product Name"].isin(filtered_products)]
 st.markdown("### Data Overview for Selected Group")
 st.write(filtered_df.head())
 
-# ----------------------------------------------------------------
-# 5. Train Model on Group Data & Display SHAP Summary Plot
-# ----------------------------------------------------------------
+# Compute and display SHAP summary plot for the filtered group data
 st.markdown("### SHAP Summary Plot for Selected Group")
 if len(filtered_df) < 10:
     st.write("Not enough data in this group to train a reliable model and compute SHAP values.")
@@ -143,7 +62,8 @@ else:
     X_group = filtered_df[group_features]
     y_group = filtered_df["Customer Order Quantity"]
     
-    model_group = xgb.XGBRegressor(n_estimators=10, random_state=0)  # Use fewer rounds for speed
+    # Train a lightweight XGBoost model
+    model_group = xgb.XGBRegressor(n_estimators=10, random_state=0)
     model_group.fit(X_group, y_group)
     
     explainer_group = shap.TreeExplainer(model_group)
